@@ -1,0 +1,698 @@
+---
+title: "Master's Thesis: Mainstream-Party Responses to the Populist Radical Right"
+subtitle: "Within-case study — Spanish manifestos (Manifesto Project)"
+author: "Carlos Morán García-Quijada"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+Code accompanying the master's thesis. Data: Manifesto Project Dataset
+MPDS2025a (Lehmann et al., 2025), accessed through the manifestoR API.
+Run the chunks in order.
+
+# 1. Setup and data
+
+## 1.1 Packages and API access
+
+```{r packages, message=FALSE, warning=FALSE}
+# --- PACKAGES ---
+# manifestoR: Manifesto Project API; quanteda / tidytext: text mining;
+# flextable: tables exported to the thesis.
+library(manifestoR)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(quanteda)
+library(tidytext)
+library(scales)
+library(lubridate)
+library(flextable)
+```
+
+```{r api-key, message=FALSE, warning=FALSE}
+# --- MANIFESTO PROJECT API KEY ---
+# Create your own manifesto_apikey.txt (one line, just the key) in the project
+# folder. The file is git-ignored and the key is never written into this script.
+mp_setapikey("manifesto_apikey.txt")
+```
+
+## 1.2 Corpus availability check
+
+```{r check-availability, message=FALSE, warning=FALSE}
+# --- CHECK WHICH SPANISH MANIFESTOS ARE AVAILABLE ---
+availability <- mp_availability(countryname == "Spain")
+availability
+```
+
+# 2. Aggregate CMP indicators
+
+## 2.1 Party selection
+
+```{r identify-parties}
+# --- SPANISH PARTIES OF INTEREST ---
+# 33610 = Partido Popular (PP), 33320 = PSOE, 33710 = Vox.
+# prr_vars collects the CMP categories tied to the radical right agenda:
+# national way of life, traditional morality, law and order, multiculturalism.
+mpds <- mp_maindataset()
+
+prr_vars <- c("per601", "per601_1", "per601_2",   # national way of life (+) / immigration (-)
+              "per602", "per602_1", "per602_2",   # national way of life (-) / immigration (+)
+              "per603", "per604",                  # traditional morality (+/-)
+              "per605", "per605_1", "per605_2",    # law and order (+/-)
+              "per607", "per607_1", "per607_2",    # multiculturalism (+) / immigrant diversity
+              "per608", "per608_1", "per608_2")    # multiculturalism (-) / immigrant assimilation
+
+spanish_parties <- mpds |>
+  filter(party %in% c(33610, 33320, 33710)) |>
+  select(partyname, party, date, all_of(prr_vars))
+
+spanish_parties
+```
+
+## 2.2 Nativist emphasis over time
+
+```{r trend-plot}
+# --- TREND PLOT: NATIVIST AND IMMIGRATION EMPHASIS ---
+# MARPOR renames Alianza Popular to Partido Popular over time although the party
+# id (33610) is stable, so a fixed label is recoded from the id.
+spanish_parties <- spanish_parties |>
+  mutate(party_label = case_when(
+    party == 33610 ~ "PP",
+    party == 33320 ~ "PSOE",
+    party == 33710 ~ "Vox"
+  ))
+
+core_long <- spanish_parties |>
+  select(party_label, date, per601, per601_2) |>
+  mutate(date = lubridate::ym(date)) |>   # turn "YYYYMM" into a real date
+  pivot_longer(cols = c(per601, per601_2), names_to = "category", values_to = "value") |>
+  mutate(category = recode(category,
+                            per601   = "National way of life (general)",
+                            per601_2 = "Immigration (restrictive)"))
+
+ggplot(core_long, aes(x = date, y = value, color = party_label)) +
+  geom_vline(xintercept = as.Date("2019-04-01"), linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  facet_wrap(~ category, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = c(PP = "#0056A3", PSOE = "#E30613", Vox = "#63BE21")) +
+  scale_x_date(date_labels = "%Y", date_breaks = "4 years") +
+  labs(x = "Election date", y = "Share of manifesto (%)", color = "Party",
+       title = "Nativist and immigration rhetoric in Spanish party manifestos") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 2.3 Category shares by party and period
+
+```{r marpor-category-shares}
+# --- CATEGORY SHARES BY PARTY AND PERIOD (Table 3.2 in the thesis) ---
+# Computed from the manifesto-level dataset, so each election counts once
+# regardless of manifesto length. This differs from the pooled quasi-sentence
+# share used for the Net Nativist Lean index in section 6.
+marpor_category_shares <- spanish_parties |>
+  filter(party_label %in% c("PP", "PSOE")) |>
+  mutate(period = if_else(date < 201904, "Pre-Vox", "Post-Vox"),
+         period = factor(period, levels = c("Pre-Vox", "Post-Vox"))) |>
+  group_by(party_label, period) |>
+  summarise(
+    per601   = mean(per601,   na.rm = TRUE),
+    per601_2 = mean(per601_2, na.rm = TRUE),
+    per605   = mean(per605,   na.rm = TRUE),
+    per608   = mean(per608,   na.rm = TRUE),
+    per602   = mean(per602,   na.rm = TRUE),
+    per605_2 = mean(per605_2, na.rm = TRUE),
+    per607   = mean(per607,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+marpor_category_shares
+```
+
+```{r table-3-2-marpor-shares}
+# --- FORMAT AND EXPORT TABLE 3.2 ---
+category_labels <- tibble(
+  category = c("per601", "per601_2", "per605", "per608", "per602", "per605_2", "per607"),
+  index    = c("Nativist Share", "Nativist Share", "Nativist Share", "Nativist Share",
+               "Cosmopolitan Share", "Cosmopolitan Share", "Cosmopolitan Share"),
+  variable_name = c(
+    "National Way of Life: Positive",
+    "National Way of Life: Immigration (Negative)",
+    "Law and Order: Positive",
+    "Multiculturalism: Negative",
+    "National Way of Life: Negative",
+    "Law and Order: Negative",
+    "Multiculturalism: Positive"
+  )
+)
+
+table_4_3_marpor_shares <- marpor_category_shares |>
+  pivot_longer(cols = c(per601, per601_2, per605, per608, per602, per605_2, per607),
+               names_to = "category", values_to = "value") |>
+  left_join(category_labels, by = "category") |>
+  mutate(category = factor(category, levels = category_labels$category)) |>
+  unite("group", party_label, period, sep = " ") |>
+  pivot_wider(names_from = group, values_from = value) |>
+  arrange(category) |>
+  select(index, marpor_code = category, variable_name,
+         `PP Pre-Vox`, `PP Post-Vox`, `PSOE Pre-Vox`, `PSOE Post-Vox`) |>
+  flextable() |>
+  set_header_labels(
+    index         = "Index Category",
+    marpor_code   = "MARPOR Code",
+    variable_name = "Variable Name"
+  ) |>
+  merge_v(j = "index") |>
+  colformat_double(j = c("PP Pre-Vox", "PP Post-Vox", "PSOE Pre-Vox", "PSOE Post-Vox"),
+                    suffix = "%", digits = 2) |>
+  set_table_properties(layout = "fixed", width = 1) |>
+  width(j = "index", width = 1.0) |>
+  width(j = "marpor_code", width = 0.75) |>
+  width(j = "variable_name", width = 1.9) |>
+  width(j = c("PP Pre-Vox", "PP Post-Vox", "PSOE Pre-Vox", "PSOE Post-Vox"), width = 0.75) |>
+  font(fontname = "Times New Roman", part = "all") |>
+  fontsize(size = 10, part = "header") |>
+  fontsize(size = 9,  part = "body") |>
+  bold(part = "header") |>
+  italic(j = "marpor_code", part = "body") |>
+  align(j = c("PP Pre-Vox", "PP Post-Vox", "PSOE Pre-Vox", "PSOE Post-Vox"), align = "center", part = "all") |>
+  valign(valign = "top", part = "all") |>
+  border_remove() |>
+  hline_top(part = "header",    border = officer::fp_border(width = 1.5)) |>
+  hline_bottom(part = "header", border = officer::fp_border(width = 1)) |>
+  hline_bottom(part = "body",   border = officer::fp_border(width = 1.5)) |>
+  add_footer_lines(
+    c(
+      "Note. Values are the mean share (%) of each manifesto's quasi-sentences coded under that MARPOR category, averaged across manifestos within each party-period cell -- a different aggregation than the Net Nativist Lean index (Figure 4.3), which pools quasi-sentences across manifestos. per601_2 (immigration-specific) is only identifiable in manifestos coded under the Manifesto Project's version-5 scheme; earlier manifestos record equivalent content under the undifferentiated per601 code. Pre-Vox/Post-Vox split at the April 2019 general election. See Table A.1 for full variable definitions.",
+      "Source. Own elaboration based on the Manifesto Project Dataset (Lehmann et al., 2025)."
+    )
+  ) |>
+  fontsize(size = 9, part = "footer") |>
+  italic(part = "footer")
+
+table_4_3_marpor_shares
+
+save_as_docx(table_4_3_marpor_shares, path = "table_4_3_marpor_shares.docx")
+```
+
+# 3. Manifesto corpus and text preparation
+
+## 3.1 Corpus download
+
+```{r download-corpus}
+# --- DOWNLOAD FULL MANIFESTO TEXT: PP AND PSOE ---
+# Filter first, then download, following the manifestoR workflow. The full
+# historical range is kept to build a long pre-treatment baseline; Vox is left
+# out because it only enters the dataset in 2019. Original Spanish text is used.
+wanted <- mpds |>
+  filter(party %in% c(33610, 33320))
+
+corpus_es <- mp_corpus(wanted)
+corpus_es
+```
+
+```{r tidy-df}
+# --- ONE ROW PER QUASI-SENTENCE ---
+manifesto_df <- mp_corpus_df(wanted)
+glimpse(manifesto_df)
+```
+
+```{r aggregate-docs}
+# --- ONE ROW PER MANIFESTO ---
+manifesto_docs <- manifesto_df |>
+  group_by(manifesto_id, party, date) |>
+  summarise(text = paste(text, collapse = " "), .groups = "drop") |>
+  mutate(party_label = if_else(party == 33610, "PP", "PSOE"))
+
+glimpse(manifesto_docs)
+```
+
+## 3.2 Extraction artefacts and tokenization
+
+```{r artifact-fix}
+# --- PDF EXTRACTION ARTEFACTS ---
+# Bullet markers glued to the next word are repaired with a regex; dropped-character
+# artefacts (mostly PSOE 2019, a font-encoding defect) are excluded rather than
+# guessed at, and documented as a data limitation.
+manifesto_docs <- manifesto_docs |>
+  mutate(text = str_replace_all(text, "\\bo(?=[A-ZÁÉÍÓÚÑ])", ""))
+
+encoding_artifacts <- c("jvenes", "automas", "oimpulsar", "opromoveremos",
+                         "oel", "ose", "nero", "rse", "po", "mos")
+```
+
+```{r tokenize-clean}
+# --- TOKENIZE, DROP STOPWORDS AND ARTEFACTS ---
+# custom_stops removes generic manifesto vocabulary with no discriminating power.
+spanish_stops <- data.frame(word = quanteda::stopwords("spanish"))
+
+custom_stops <- data.frame(word = c(
+  "política", "político", "políticas", "social", "españa", "sistema",
+  "desarrollo", "gobierno", "así", "ello", "mayor", "general", "nivel",
+  "forma", "manera", "año", "años", "popular", "partido"
+))
+
+tidy_manifestos <- manifesto_docs |>
+  unnest_tokens(word, text) |>
+  anti_join(spanish_stops, by = "word") |>
+  anti_join(custom_stops, by = "word") |>
+  filter(str_detect(word, "^[a-záéíóúñü]+$"), nchar(word) >= 3) |>  # alphabetic, length >= 3
+  filter(!word %in% encoding_artifacts) |>
+  mutate(period = if_else(date < 201904, "pre-Vox", "post-Vox"),
+         group_label = paste(party_label, period, sep = " - "))
+
+tidy_manifestos |>
+  count(party_label, word, sort = TRUE) |>
+  group_by(party_label) |>
+  slice_max(n, n = 15) |>
+  ungroup()
+```
+
+# 4. Distinctive vocabulary (TF-IDF)
+
+```{r tfidf-party}
+# --- TF-IDF: MOST DISTINCTIVE WORDS PER PARTY ---
+# Each party is treated as one document spanning its whole history.
+tfidf_party <- tidy_manifestos |>
+  count(party_label, word) |>
+  bind_tf_idf(word, party_label, n) |>
+  arrange(desc(tf_idf))
+
+tfidf_party |>
+  group_by(party_label) |>
+  slice_max(tf_idf, n = 15) |>
+  ungroup() |>
+  print(n = 30)
+```
+
+```{r tfidf-plot}
+# --- PLOT: DISTINCTIVE WORDS ---
+tfidf_party |>
+  group_by(party_label) |>
+  slice_max(tf_idf, n = 15) |>
+  ungroup() |>
+  mutate(word = reorder_within(word, tf_idf, party_label)) |>
+  ggplot(aes(tf_idf, word, fill = party_label)) +
+  geom_col(show.legend = FALSE) +
+  scale_y_reordered() +
+  scale_fill_manual(values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  facet_wrap(~party_label, scales = "free_y") +
+  labs(title = "Most Distinctive Words by Party (TF-IDF)",
+       x = "tf-idf", y = NULL) +
+  theme_minimal()
+```
+
+# 5. Nativist and security glossary
+
+## 5.1 Glossary frequency
+
+```{r glossary-def}
+# --- THEORY-DRIVEN NATIVIST / SECURITY GLOSSARY ---
+# Terms are tied to the same CMP categories used in the quantitative chapter,
+# and hits are normalised per 1,000 words because manifesto length varies widely.
+nativist_terms <- c("inmigración", "inmigrantes", "ilegal", "ilegales",
+                     "frontera", "fronteras", "seguridad", "delincuencia",
+                     "identidad nacional", "patria", "soberanía",
+                     "ley y orden", "expulsión", "extranjeros",
+                     "multiculturalismo", "nación")
+
+glossary_freq <- manifesto_docs |>
+  mutate(year = as.numeric(substr(date, 1, 4)),
+         text_lower = str_to_lower(text),
+         n_words = str_count(text, "\\S+"),
+         n_hits = str_count(text_lower, paste(nativist_terms, collapse = "|"))) |>
+  group_by(party_label, year) |>
+  summarise(n_hits = sum(n_hits), n_words = sum(n_words), .groups = "drop") |>
+  mutate(freq_per_1000 = 1000 * n_hits / n_words)
+
+glossary_freq
+```
+
+```{r glossary-plot}
+# --- PLOT: GLOSSARY FREQUENCY OVER TIME ---
+glossary_freq |>
+  ggplot(aes(year, freq_per_1000, color = party_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2019, linetype = "dashed", color = "grey40") +
+  scale_color_manual(name = "Party",
+                      values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  labs(title = "Nativist/Security Glossary Frequency Over Time",
+       subtitle = "Dashed line marks Vox's 2019 parliamentary breakthrough",
+       x = "Election year", y = "Hits per 1,000 words") +
+  theme_minimal()
+```
+
+## 5.2 Term-level breakdown, 2019
+
+```{r term-breakdown}
+# --- WHICH TERMS DRIVE THE 2019 PEAK ---
+# The April and November 2019 manifestos are pooled per party.
+docs_2019 <- manifesto_docs |>
+  mutate(year = as.numeric(substr(date, 1, 4)),
+         text_lower = str_to_lower(text)) |>
+  filter(year == 2019) |>
+  group_by(party_label) |>
+  summarise(text_lower = paste(text_lower, collapse = " "), .groups = "drop")
+
+term_breakdown_2019 <- expand_grid(party_label = docs_2019$party_label,
+                                    term = nativist_terms) |>
+  left_join(docs_2019, by = "party_label") |>
+  mutate(n = str_count(text_lower, term)) |>
+  select(party_label, term, n) |>
+  arrange(party_label, desc(n))
+
+term_breakdown_2019 |> print(n = 32)
+```
+
+## 5.3 Within-party z-scores
+
+```{r zscore-calc}
+# --- WITHIN-PARTY Z-SCORES ---
+# Standardising within party answers how atypical a year is for that party,
+# which is comparable across parties; raw frequencies are not.
+glossary_z <- glossary_freq |>
+  group_by(party_label) |>
+  mutate(z_score = (freq_per_1000 - mean(freq_per_1000)) / sd(freq_per_1000)) |>
+  ungroup()
+
+glossary_z
+```
+
+```{r zscore-plot}
+# --- PLOT: Z-SCORE TREND ---
+glossary_z |>
+  ggplot(aes(year, z_score, color = party_label)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+  geom_vline(xintercept = 2019, linetype = "dashed", color = "grey40") +
+  scale_color_manual(name = "Party",
+                      values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  labs(title = "Nativist/Security Rhetoric: Within-Party Z-Score Over Time",
+       subtitle = "0 = party's own historical average; dashed line marks 2019",
+       x = "Election year", y = "Z-score") +
+  theme_minimal()
+```
+
+# 6. CMP code-filtered indices
+
+## 6.1 Nativist-congruent share
+
+```{r nativist-filter}
+# --- NATIVIST-CONGRUENT CMP CODES ---
+# per601 (national pride and anti-new-immigration), per605_1 (pro law and order)
+# and per608 (anti-multiculturalism) share the same valence. per605_2 is excluded
+# (opposite stance) and per602 entirely (it mixes anti-nationalism with
+# pro-immigration).
+# Legacy three-digit codes AND decimal subcodes are both listed: manifestos coded
+# before and after the version-5 recoding carry one spelling or the other, never
+# both, so checking only one would silently drop whole manifestos.
+nativist_codes <- c("601", "601.1", "601.2",
+                     "605", "605.1",
+                     "608", "608.1", "608.2", "608.3")
+
+nativist_sentences <- manifesto_df |>
+  filter(cmp_code %in% nativist_codes) |>
+  mutate(party_label = if_else(party == 33610, "PP", "PSOE"),
+         period = if_else(date < 201904, "pre-Vox", "post-Vox"),
+         group_label = paste(party_label, period, sep = " - "))
+```
+
+```{r nativist-share}
+# --- SHARE OF NATIVIST-CONGRUENT QUASI-SENTENCES ---
+# Denominator: every codeable quasi-sentence in the party-period cell.
+nativist_share <- manifesto_df |>
+  mutate(party_label = if_else(party == 33610, "PP", "PSOE"),
+         period = if_else(date < 201904, "pre-Vox", "post-Vox"),
+         group_label = paste(party_label, period, sep = " - ")) |>
+  filter(!is.na(cmp_code)) |>          # denominator: all codeable sentences
+  group_by(group_label) |>
+  summarise(n_nativist = sum(cmp_code %in% nativist_codes),
+            n_total = n(), .groups = "drop") |>
+  mutate(share = n_nativist / n_total)
+
+nativist_share
+```
+
+```{r nativist-plot}
+# --- PLOT: PRE/POST SHARE BY PARTY ---
+nativist_share |>
+  mutate(period = if_else(str_detect(group_label, "post"), "post-Vox", "pre-Vox"),
+         party_label = if_else(str_detect(group_label, "PP"), "PP", "PSOE"),
+         period = factor(period, levels = c("pre-Vox", "post-Vox"))) |>
+  ggplot(aes(period, share, color = party_label, group = party_label)) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 4) +
+  geom_text(aes(label = scales::percent(share, accuracy = 0.1)),
+            vjust = -1.4, size = 4, show.legend = FALSE) +
+  scale_color_manual(name = "Party", values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA)) +
+  scale_x_discrete(expand = expansion(mult = 0.4)) +
+  labs(title = "Nativist / Law-and-Order Rhetoric Before and After Vox",
+       subtitle = "Share of CMP-coded quasi-sentences (per601 + per605_1 + per608)",
+       x = NULL, y = "Share of coded quasi-sentences") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "right")
+```
+
+## 6.2 Cosmopolitan counter-share
+
+```{r counter-codes}
+# --- COSMOPOLITAN COUNTER-CODES ---
+# Opposite-valence mirror of the nativist set, same denominator.
+counter_codes <- c("602", "602.1", "602.2",
+                    "605.2",
+                    "607", "607.1", "607.2", "607.3")
+
+counter_share <- manifesto_df |>
+  mutate(party_label = if_else(party == 33610, "PP", "PSOE"),
+         period = if_else(date < 201904, "pre-Vox", "post-Vox"),
+         group_label = paste(party_label, period, sep = " - ")) |>
+  filter(!is.na(cmp_code)) |>          # same denominator as the nativist index
+  group_by(group_label) |>
+  summarise(n_counter = sum(cmp_code %in% counter_codes),
+            n_total = n(), .groups = "drop") |>
+  mutate(share = n_counter / n_total)
+
+counter_share
+```
+
+## 6.3 Net Nativist Lean
+
+```{r net-lean-calc}
+# --- NET NATIVIST LEAN = NATIVIST SHARE - COSMOPOLITAN SHARE ---
+# Netting out the cosmopolitan share means a rise reflects an ideological
+# shift rather than a general expansion of domestic policy sections.
+net_lean <- nativist_share |>
+  select(group_label, nativist = share) |>
+  left_join(counter_share |> select(group_label, cosmopolitan = share), by = "group_label") |>
+  mutate(net = nativist - cosmopolitan,
+         period = if_else(str_detect(group_label, "post"), "post-Vox", "pre-Vox"),
+         party_label = if_else(str_detect(group_label, "PP"), "PP", "PSOE"),
+         period = factor(period, levels = c("pre-Vox", "post-Vox")))
+
+net_lean
+```
+
+```{r fig-3-3-net-lean-colour}
+# --- FIGURE 3.3 (COLOUR) ---
+# No title inside the plot: the caption lives in the thesis document.
+# 5.77 x 4 in at 600 dpi, matching the CHES figures.
+p_net_lean_colour <- net_lean |>
+  ggplot(aes(period, net, fill = party_label)) +
+  geom_col(position = position_dodge(width = 0.6), width = 0.5) +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_text(aes(label = scales::percent(net, accuracy = 0.1)),
+            position = position_dodge(width = 0.6), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(name = "Party", values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA),
+                      expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "Net share (percentage points)") +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    axis.title.y = element_text(margin = margin(r = 8)),
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 5.5)
+  )
+
+p_net_lean_colour
+
+ggsave("figure_net_nativist_lean_colour.png", plot = p_net_lean_colour,
+       width = 5.77, height = 4, units = "in", dpi = 600)
+```
+
+```{r fig-3-3-net-lean-bw}
+# --- FIGURE 3.3 (BLACK AND WHITE) ---
+# Greyscale version for printing.
+p_net_lean_bw <- net_lean |>
+  ggplot(aes(period, net, fill = party_label)) +
+  geom_col(position = position_dodge(width = 0.6), width = 0.5, colour = "black") +
+  geom_hline(yintercept = 0, colour = "grey40") +
+  geom_text(aes(label = scales::percent(net, accuracy = 0.1)),
+            position = position_dodge(width = 0.6), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(name = "Party", values = c("PP" = "grey20", "PSOE" = "grey70")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, NA),
+                      expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "Net share (percentage points)") +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    axis.title.y = element_text(margin = margin(r = 8)),
+    plot.margin = margin(t = 5.5, r = 5.5, b = 5.5, l = 5.5)
+  )
+
+p_net_lean_bw
+
+ggsave("figure_net_nativist_lean_bw.png", plot = p_net_lean_bw,
+       width = 5.77, height = 4, units = "in", dpi = 600)
+```
+
+# 7. Term associations and illustrative quotes
+
+## 7.1 Co-occurrence with "inmigra*"
+
+```{r coocc-calc}
+# --- WORDS CO-OCCURRING WITH "INMIGRA*" ---
+# Restricted to quasi-sentences already coded as nativist, so the comparison
+# is about framing within the same topic.
+immigration_context <- nativist_sentences |>
+  filter(str_detect(text, regex("inmigra", ignore_case = TRUE))) |>
+  unnest_tokens(word, text) |>
+  anti_join(spanish_stops, by = "word") |>   # remove generic Spanish stopwords
+  anti_join(custom_stops, by = "word") |>    # remove corpus-specific artifacts
+  filter(!str_detect(word, "inmigra"),
+         str_length(word) > 2) |>            # drop leftover single letters/numbers
+  count(party_label, word, sort = TRUE)
+
+top_immigration_context <- immigration_context |>
+  group_by(party_label) |>
+  slice_max(n, n = 10, with_ties = FALSE) |>
+  ungroup()
+
+top_immigration_context
+```
+
+```{r coocc-plot}
+# --- PLOT: CO-OCCURRING WORDS ---
+top_immigration_context |>
+  mutate(word = reorder_within(word, n, party_label)) |>
+  ggplot(aes(word, n, fill = party_label)) +
+  geom_col(show.legend = FALSE) +
+  scale_x_reordered() +
+  scale_fill_manual(values = c("PP" = "#0056A3", "PSOE" = "#E30613")) +
+  facet_wrap(~party_label, scales = "free_y") +
+  coord_flip() +
+  labs(title = "Words Co-occurring with \"Inmigra*\"",
+       subtitle = "Within nativist/law-and-order coded quasi-sentences",
+       x = NULL, y = "Count") +
+  theme_minimal(base_size = 12)
+```
+
+## 7.2 Representative quotations
+
+```{r quotes-extract}
+# --- ILLUSTRATIVE QUOTATIONS: PP, POST-VOX ---
+# Fixed seed so the sampled quotations are reproducible.
+set.seed(2024)  # reproducible sample
+nativist_sentences |>
+  filter(party_label == "PP", period == "post-Vox",
+         str_detect(text, regex("inmigra|extranjer|frontera", ignore_case = TRUE)),
+         str_length(text) > 40) |>
+  distinct(text) |>
+  slice_sample(n = 3) |>
+  pull(text)
+```
+
+# 8. Appendix table: MARPOR variable definitions
+
+```{r appendix-marpor-vars}
+# --- APPENDIX TABLE A.2 DATA: MARPOR VARIABLE DEFINITIONS ---
+# Definitions quoted from the Manifesto Project codebook (Lehmann et al., 2025).
+# The stopifnot() below guarantees the documented codes stay in sync with the
+# vectors the analysis actually filters on.
+marpor_variable_definitions <- tibble(
+  index_category = c(
+    "Nativist Share", "Nativist Share", "Nativist Share",
+    "Cosmopolitan Share", "Cosmopolitan Share", "Cosmopolitan Share"
+  ),
+  marpor_code = c(
+    "per601",
+    "per605",
+    "per608",
+    "per602",
+    "per605.2",
+    "per607"
+  ),
+  variable_name = c(
+    "National Way of Life: Positive",
+    "Law and Order: Positive",
+    "Multiculturalism: Negative",
+    "National Way of Life: Negative",
+    "Law and Order: Negative",
+    "Multiculturalism: Positive"
+  ),
+  definition = c(
+    "Favourable mentions of the manifesto country's nation, history, and general appeals. May include support for established national ideas, general appeals to pride of citizenship, appeals to patriotism or nationalism, and suspension of some freedoms to protect the state against subversion.",
+    "Favourable mentions of strict law enforcement and tougher actions against domestic crime. Only refers to enforcement of the status quo of the manifesto country's law code. May include increasing support and resources for the police, tougher attitudes in courts, and the importance of internal security.",
+    "The enforcement or encouragement of cultural integration. Appeals for cultural homogeneity in society.",
+    "Unfavourable mentions of the manifesto country's nation and history. May include opposition to patriotism, nationalism, or the existing national state, national pride, and national ideas.",
+    "Favourable mentions of less law enforcement or rejection of plans for stronger law enforcement. Only refers to enforcement of the status quo of the manifesto country's law code. May include fewer resources for police, reducing penalties, and decriminalisation.",
+    "Favourable mentions of cultural diversity and cultural plurality within domestic societies. May include the preservation of autonomy of religious and linguistic heritages, including special educational provisions."
+  )
+)
+
+stopifnot(
+  all(c("601", "601.1", "601.2", "605", "605.1", "608", "608.1", "608.2", "608.3") %in% nativist_codes),
+  all(c("602", "602.1", "602.2", "605.2", "607", "607.1", "607.2", "607.3") %in% counter_codes)
+)
+
+marpor_variable_definitions
+```
+
+```{r table-a2-marpor-vars}
+# --- FORMAT AND EXPORT APPENDIX TABLE A.2 ---
+table_a1_marpor_vars <- marpor_variable_definitions |>
+  flextable() |>
+  set_header_labels(
+    index_category = "Index Category",
+    marpor_code    = "MARPOR Code",
+    variable_name  = "Variable Name",
+    definition     = "Official Definition and Coding Protocol"
+  ) |>
+  merge_v(j = "index_category") |>                          # merge repeated Nativist/Cosmopolitan labels
+  set_table_properties(layout = "fixed", width = 1) |>      # fixed layout: respect the widths below exactly
+  width(j = "index_category", width = 1.0) |>
+  width(j = "marpor_code",    width = 0.75) |>               # short codes only now, fits on one line
+  width(j = "variable_name",  width = 1.35) |>
+  width(j = "definition",     width = 3.3) |>
+  font(fontname = "Times New Roman", part = "all") |>
+  fontsize(size = 10, part = "header") |>
+  fontsize(size = 9,  part = "body") |>
+  bold(part = "header") |>
+  italic(j = "marpor_code", part = "body") |>
+  valign(valign = "top", part = "all") |>
+  border_remove() |>
+  hline_top(part = "header",    border = officer::fp_border(width = 1.5)) |>
+  hline_bottom(part = "header", border = officer::fp_border(width = 1)) |>
+  hline_bottom(part = "body",   border = officer::fp_border(width = 1.5)) |>
+  add_footer_lines(
+    c(
+      "Note. In manifestos coded under the Manifesto Project's version-5 recoding, per601 = per601.1 + per601.2, per608 = per608.1 + per608.2 + per608.3, per602 = per602.1 + per602.2, and per607 = per607.1 + per607.2 + per607.3; per605 equals per605.1 alone, and per605.2 (Law and Order: Negative) has no legacy equivalent, having been introduced only in version 5. Both spellings are checked when filtering cmp_code, since a given manifesto carries one or the other depending on its coding vintage.",
+      "Source. Definitions adapted from the Manifesto Project Dataset Codebook, Version 2025a (Lehmann et al., 2025)."
+    )
+  ) |>
+  fontsize(size = 9, part = "footer") |>
+  italic(part = "footer")
+
+table_a1_marpor_vars
+
+save_as_docx(table_a1_marpor_vars, path = "table_A1_marpor_variables.docx")
+```
