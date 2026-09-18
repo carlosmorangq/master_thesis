@@ -1,0 +1,1782 @@
+---
+title: "Master's Thesis: Mainstream-Party Responses to the Populist Radical Right"
+subtitle: "Comparative analysis — CHES trend data, 1999–2024"
+author: "Carlos Morán García-Quijada"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+  pdf_document:
+    toc: true
+    toc_depth: 2
+---
+
+Code accompanying the master's thesis. Data: Chapel Hill Expert Survey trend
+file 1999-2024 (Rovny et al., 2025). Run the chunks in order.
+
+```{r setup, include=FALSE}
+# --- KNITR DEFAULTS ---
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE)
+```
+
+# 1. Setup and data
+
+## 1.1 Packages and reproducibility
+
+```{r packages}
+# --- PACKAGES ---
+# fixest: TWFE benchmark and Sun-Abraham event study
+# did: Callaway-Sant'Anna estimator (main specification)
+# flextable / stargazer / kableExtra: tables exported to the thesis
+library(tidyverse)
+library(fixest)
+library(did)
+
+library(knitr)
+library(kableExtra)
+library(flextable)
+library(stargazer)
+library(patchwork)
+```
+
+```{r table-formatting-function}
+# --- SHARED TABLE FORMATTER ---
+# One helper so every ATT table in the thesis shares identical styling
+# (Times New Roman 10 pt, booktabs rules, note + source footer).
+format_att_table <- function(data, caption) {
+  
+  data |>
+    mutate(
+      `ATT (SE)` = sprintf("%.3f (%.3f)", att, se),
+      `95% CI` = sprintf("[%.3f, %.3f]", lower, upper)
+    ) |>
+    select(sample, outcome, `ATT (SE)`, `95% CI`) |>
+    kable(
+      format = "html",
+      caption = caption,
+      col.names = c("Sample", "Outcome", "ATT (SE)", "95% CI"),
+      align = c("l", "l", "c", "c"),
+      escape = FALSE
+    ) |>
+    kable_styling(
+      full_width = FALSE,
+      position = "center",
+      bootstrap_options = c("striped", "hover", "condensed")
+    )
+}
+```
+
+## 1.2 Load CHES trend file
+
+```{r load-data}
+# --- LOAD CHES TREND FILE (1999-2024) ---
+# Raw trend file as distributed by Rovny et al. (2025); nothing is edited by hand.
+ches_raw <- read_csv(
+  "1999-2024_CHES_dataset_meansV2.csv",
+  show_col_types = FALSE
+)
+
+ches <- ches_raw
+```
+
+## 1.3 Labels and technical checks
+
+```{r labels}
+# --- COUNTRY AND PARTY-FAMILY LABELS ---
+# CHES ships numeric codes; readable labels are attached once here so every
+# downstream table and figure inherits them.
+country_labels <- c(
+  `1` = "Belgium",
+  `2` = "Denmark",
+  `3` = "Germany",
+  `4` = "Greece",
+  `5` = "Spain",
+  `6` = "France",
+  `7` = "Ireland",
+  `8` = "Italy",
+  `10` = "Netherlands",
+  `11` = "United Kingdom",
+  `12` = "Portugal",
+  `13` = "Austria",
+  `14` = "Finland",
+  `16` = "Sweden",
+  `20` = "Bulgaria",
+  `21` = "Czech Republic",
+  `22` = "Estonia",
+  `23` = "Hungary",
+  `24` = "Latvia",
+  `25` = "Lithuania",
+  `26` = "Poland",
+  `27` = "Romania",
+  `28` = "Slovakia",
+  `29` = "Slovenia",
+  `31` = "Croatia",
+  `37` = "Malta",
+  `38` = "Luxembourg",
+  `40` = "Cyprus"
+)
+
+family_labels <- c(
+  `1` = "Radical right",
+  `2` = "Conservative",
+  `3` = "Liberal",
+  `4` = "Christian-democratic",
+  `5` = "Socialist",
+  `6` = "Radical left",
+  `7` = "Green",
+  `8` = "Regionalist",
+  `9` = "No family",
+  `10` = "Confessional",
+  `11` = "Agrarian/Centre"
+)
+
+ches <- ches |>
+  mutate(
+    country_name = recode(as.character(country), !!!country_labels),
+    family_name = recode(as.character(family), !!!family_labels),
+    region_name = case_when(
+      eastwest == 1 ~ "Western Europe",
+      eastwest == 0 ~ "Central/Eastern Europe",
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+```{r technical-checks, include=FALSE}
+# --- SANITY CHECKS (not reported) ---
+# include=FALSE keeps these out of the knitted document.
+stopifnot(!anyDuplicated(ches[c("party_id", "year")]))
+
+technical_checks <- list(
+  data_dimensions = dim(ches),
+  waves = ches |> distinct(year) |> arrange(year),
+  party_year_duplicates = ches |> count(party_id, year) |> filter(n > 1),
+  party_multiple_countries = ches |> distinct(party_id, country) |>
+    count(party_id) |> filter(n > 1),
+  vote_seat_ranges = ches |>
+    summarise(
+      vote_min = min(vote, na.rm = TRUE),
+      vote_max = max(vote, na.rm = TRUE),
+      seat_min = min(seat, na.rm = TRUE),
+      seat_max = max(seat, na.rm = TRUE)
+    )
+)
+```
+
+## 1.4 Outcome coverage
+
+```{r outcome-coverage}
+# --- ITEM COVERAGE BY WAVE ---
+# Documents why immigration models start in 2006: the immigration items enter
+# CHES in that wave, and immigration salience is missing in 2014.
+outcomes_core <- c(
+  "galtan",
+  "immigrate_policy",
+  "immigrate_salience",
+  "multiculturalism",
+  "lrecon"
+)
+
+outcome_coverage <- ches |>
+  group_by(year) |>
+  summarise(
+    across(
+      all_of(outcomes_core),
+      ~ round(mean(!is.na(.x)) * 100, 1)
+    ),
+    .groups = "drop"
+  )
+
+outcome_coverage
+```
+
+# 2. Treatment and analytical sample
+
+## 2.1 Radical-right parties and treatment definition
+
+```{r radical-right-identification}
+# --- TREATMENT DEFINITION ---
+# A country is treated in the first wave in which a CHES-classified radical
+# right party (family == 1) holds at least 5% of national parliamentary seats.
+# Seats rather than votes: under a vote threshold France would already be
+# treated in 1999, losing its entire pre-treatment window.
+ches <- ches |>
+  mutate(is_prrp_ches = family == 1)
+
+prrp_seat_summary <- ches |>
+  filter(
+    is_prrp_ches,
+    eastwest == 1
+  ) |>
+  group_by(country, country_name, year) |>
+  summarise(
+    max_prrp_seat = if (all(is.na(seat))) {
+  NA_real_
+} else {
+  max(seat, na.rm = TRUE)
+},
+    prrp_parties = paste(
+      party[!is.na(seat) & seat >= 5],
+      collapse = " / "
+    ),
+    .groups = "drop"
+  ) |>
+  mutate(breakthrough = !is.na(max_prrp_seat) & max_prrp_seat >= 5)
+
+treatment_cohorts <- prrp_seat_summary |>
+  filter(breakthrough) |>
+  group_by(country, country_name) |>
+  summarise(
+    treatment_year = min(year),
+    .groups = "drop"
+  ) |>
+  arrange(treatment_year, country)
+
+treatment_cohorts
+```
+
+## 2.2 Country-level cohorts
+
+```{r country-cohorts}
+# --- COUNTRY COHORTS ---
+# Countries already treated in the first observed wave have no pre-treatment
+# period and are therefore dropped from the estimation sample.
+western_country_cohorts <- ches |>
+  filter(eastwest == 1) |>
+  distinct(country, country_name) |>
+  left_join(
+    treatment_cohorts,
+    by = c("country", "country_name")
+  ) |>
+  mutate(
+    first_wave = min(ches$year),
+    treatment_status = case_when(
+      is.na(treatment_year) ~ "Never treated",
+      treatment_year == first_wave ~ "Treated from first wave",
+      TRUE ~ "Treated during observation window"
+    )
+  ) |>
+  select(
+    country,
+    country_name,
+    treatment_year,
+    treatment_status
+  ) |>
+  arrange(treatment_year, country)
+
+usable_country_cohorts <- western_country_cohorts |>
+  filter(treatment_status != "Treated from first wave")
+
+usable_country_cohorts
+```
+
+### 2.2.1 Country cohort table
+
+```{r cohort-table}
+# --- COHORT TABLE DATA (Table 2.1 in the thesis) ---
+cohort_table <- western_country_cohorts |>
+  mutate(
+    empirical_role = case_when(
+      treatment_status == "Never treated" ~
+        "Never-treated (pure control group)",
+      treatment_status == "Treated from first wave" ~
+        "Treated from first wave (excluded)",
+      TRUE ~ "Treatment cohort (staggered adoption)"
+    )
+  ) |>
+  group_by(empirical_role, treatment_year) |>
+  summarise(
+    countries = paste(sort(country_name), collapse = ", "),
+    .groups = "drop"
+  ) |>
+  arrange(
+    factor(
+      empirical_role,
+      levels = c(
+        "Treatment cohort (staggered adoption)",
+        "Treated from first wave (excluded)",
+        "Never-treated (pure control group)"
+      )
+    ),
+    treatment_year
+  )
+
+cohort_table
+```
+
+```{r table-cohorts}
+# --- FORMAT AND EXPORT TABLE 2.1 ---
+table_cohorts <- cohort_table |>
+  mutate(
+    wave = if_else(is.na(treatment_year), "\u2014", as.character(treatment_year))
+  ) |>
+  select(empirical_role, wave, countries) |>
+  flextable() |>
+  set_header_labels(
+    empirical_role = "Empirical role",
+    wave           = "Breakthrough wave (year)",
+    countries      = "Countries"
+  ) |>
+  merge_v(j = "empirical_role") |>                # merge the role label into a single block
+  valign(j = "empirical_role", valign = "top") |>
+  theme_booktabs() |>
+  align(align = "left", part = "all") |>
+  bold(part = "header") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  fontsize(size = 10, part = "all") |>
+  hline(i = c(5, 6), border = officer::fp_border(width = 0.5)) |>  # rule separating the three groups
+  add_footer_lines(
+    c(
+      "Note. Western European staggered treatment cohorts are relatively small and occasionally contain a single country. Consequently, cohort-specific estimates should be interpreted with caution.",
+      "Source. Own elaboration based on the 1999\u20132024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+    )
+  ) |>
+  italic(part = "footer") |>
+  fontsize(size = 9, part = "footer") |>
+  autofit()
+
+table_cohorts
+
+save_as_docx(table_cohorts, path = "table_cohorts.docx")
+```
+
+## 2.3 Party-wave DiD panel
+
+```{r did-panel}
+# --- PARTY-WAVE ANALYTICAL PANEL ---
+# Mainstream = non-PRRP parties from the four traditional governing families
+# (CHES families 2-5: conservative, liberal, Christian-democratic, socialist).
+# wave: ordinal wave index (1-7) instead of calendar year, so cohorts stay
+# comparable despite irregular CHES intervals.
+# g_wave = 0 flags never-treated units, as att_gt() expects.
+ches <- ches |>
+  mutate(wave = match(year, sort(unique(year))))
+
+usable_country_cohorts <- usable_country_cohorts |>
+  mutate(
+    g_wave = case_when(
+      is.na(treatment_year) ~ 0L,
+      TRUE ~ match(treatment_year, sort(unique(ches$year)))
+    )
+  )
+
+did_panel <- ches |>
+  filter(
+    eastwest == 1,
+    !is_prrp_ches,
+    family %in% c(2, 3, 4, 5)
+  ) |>
+  left_join(
+    usable_country_cohorts |>
+      select(
+        country,
+        country_name,
+        treatment_year,
+        treatment_status,
+        g_wave
+      ),
+    by = c("country", "country_name")
+  ) |>
+  filter(!is.na(treatment_status)) |>
+  select(
+    party_id,
+    party,
+    country,
+    country_name,
+    year,
+    wave,
+    family,
+    family_name,
+    vote,
+    seat,
+    treatment_year,
+    treatment_status,
+    g_wave,
+    galtan,
+    immigrate_policy,
+    immigrate_salience,
+    multiculturalism,
+    lrecon
+  ) |>
+  mutate(
+    treated = case_when(
+      g_wave == 0 ~ 0L,
+      wave >= g_wave ~ 1L,
+      TRUE ~ 0L
+    )
+  )
+
+sample_overview <- did_panel |>
+  summarise(
+    countries = n_distinct(country),
+    parties = n_distinct(party_id),
+    observations = n(),
+    treated_countries = n_distinct(country[g_wave > 0]),
+    never_treated_countries = n_distinct(country[g_wave == 0])
+  )
+
+sample_overview
+```
+
+## 2.4 Electoral-size thresholds
+
+```{r electoral-size-thresholds}
+# --- RESTRICTED SAMPLES BY PRE-TREATMENT SIZE ---
+# Mean vote share is computed only over each party's pre-treatment waves, so
+# sample membership cannot be affected by the breakthrough itself.
+party_size_pre <- did_panel |>
+  filter(is.na(treatment_year) | year < treatment_year) |>
+  group_by(country, country_name, party_id) |>
+  summarise(
+    party_names = paste(sort(unique(party)), collapse = " / "),
+    pre_treatment_mean_vote = if_else(
+      all(is.na(vote)),
+      NA_real_,
+      mean(vote, na.rm = TRUE)
+    ),
+    n_pre_treatment_waves = sum(!is.na(vote)),
+    .groups = "drop"
+  )
+
+party_ids_5 <- party_size_pre |>
+  filter(pre_treatment_mean_vote >= 5) |>
+  pull(party_id)
+
+party_ids_10 <- party_size_pre |>
+  filter(pre_treatment_mean_vote >= 10) |>
+  pull(party_id)
+
+did_panel_5 <- did_panel |>
+  filter(party_id %in% party_ids_5)
+
+did_panel_10 <- did_panel |>
+  filter(party_id %in% party_ids_10)
+
+threshold_overview <- tibble(
+  sample = c("Broad sample", "At least 5% pre-treatment vote", "At least 10% pre-treatment vote"),
+  parties = c(
+    n_distinct(did_panel$party_id),
+    n_distinct(did_panel_5$party_id),
+    n_distinct(did_panel_10$party_id)
+  ),
+  observations = c(nrow(did_panel), nrow(did_panel_5), nrow(did_panel_10))
+)
+
+threshold_overview
+```
+
+### 2.4.1 Nested analytical sample configurations
+
+```{r nested-sample-config-table}
+# --- NESTED SAMPLE TABLE DATA (Appendix Table A.1) ---
+sample_table <- threshold_overview |>
+  mutate(
+    selection_criterion = case_when(
+      sample == "Broad sample" ~
+        "All non-PRRP mainstream parties (conservative, liberal, Christian-democratic, socialist)",
+      sample == "At least 5% pre-treatment vote" ~
+        "Pre-treatment average vote share \u2265 5%",
+      sample == "At least 10% pre-treatment vote" ~
+        "Pre-treatment average vote share \u2265 10%"
+    )
+  ) |>
+  select(sample, selection_criterion, parties, observations)
+
+sample_table
+```
+
+```{r table-samples}
+# --- FORMAT AND EXPORT APPENDIX TABLE A.1 ---
+table_samples <- sample_table |>
+  flextable() |>
+  set_header_labels(
+    sample              = "Sample",
+    selection_criterion = "Selection criterion",
+    parties             = "No. of parties",
+    observations        = "No. of observations"
+  ) |>
+  theme_booktabs() |>
+  align(align = "left", part = "all") |>
+  align(j = c("parties", "observations"), align = "center", part = "all") |>  # centred numeric columns
+  bold(part = "header") |>
+  font(fontname = "Times New Roman", part = "all") |>
+  fontsize(size = 10, part = "all") |>
+  add_footer_lines(
+    c(
+      "Note. Observations are party-wave units. All three samples span the same 11 Western European countries.",
+      "Source. Own elaboration based on the 1999\u20132024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+    )
+  ) |>
+  italic(part = "footer") |>
+  fontsize(size = 9, part = "footer") |>
+  set_table_properties(layout = "autofit", width = 1)
+
+table_samples
+
+save_as_docx(table_samples, path = "table3_2_samples.docx")
+```
+
+# 3. Descriptive evidence
+
+## 3.1 Treatment timing
+
+```{r treatment-timing-plot}
+# --- DESCRIPTIVE: TREATMENT TIMING ---
+treatment_timing_plot <- western_country_cohorts |>
+  filter(treatment_status != "Treated from first wave") |>
+  mutate(
+    treatment_label = if_else(
+      is.na(treatment_year),
+      "Never treated",
+      as.character(treatment_year)
+    ),
+    country_name = forcats::fct_reorder(
+      country_name,
+      if_else(is.na(treatment_year), 2030, treatment_year)
+    )
+  ) |>
+  ggplot(aes(x = country_name, y = treatment_label, fill = treatment_status)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Treatment timing by country",
+    x = NULL,
+    y = "First qualifying breakthrough wave"
+  ) +
+  theme_minimal(base_size = 11)
+
+treatment_timing_plot
+```
+
+## 3.2 Aggregate GAL-TAN trajectories
+
+```{r galtan-descriptive-trajectories}
+# --- DESCRIPTIVE: GAL-TAN TRAJECTORIES BY TREATMENT STATUS ---
+# Raw means by wave; a first visual check of the parallel-trends assumption.
+galtan_group_trajectories <- did_panel |>
+  mutate(
+    comparison_group = case_when(
+      treatment_status == "Never treated" ~ "Never treated",
+      TRUE ~ "Treated countries"
+    )
+  ) |>
+  group_by(comparison_group, year, wave) |>
+  summarise(
+    mean_galtan = mean(galtan, na.rm = TRUE),
+    n = sum(!is.na(galtan)),
+    sd = sd(galtan, na.rm = TRUE),
+    se = sd / sqrt(n),
+    lower = mean_galtan - 1.96 * se,
+    upper = mean_galtan + 1.96 * se,
+    .groups = "drop"
+  )
+
+last_points_colour <- galtan_group_trajectories |>
+  group_by(comparison_group) |>
+  slice_max(year, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+p_galtan_colour <- ggplot(
+  galtan_group_trajectories,
+  aes(
+    x = year,
+    y = mean_galtan,
+    colour = comparison_group,
+    linetype = comparison_group,
+    shape = comparison_group,
+    group = comparison_group
+  )
+) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.35,
+    linewidth = 0.4
+  ) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 2.4, stroke = 0.7) +
+  geom_text(
+    data = last_points_colour,
+    aes(label = comparison_group),
+    hjust = 0,
+    nudge_x = 1,
+    size = 3.2,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(
+    values = c(
+      "Never treated" = "#F8766D",
+      "Treated countries" = "#00BFC4"
+    )
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Never treated" = 1,
+      "Treated countries" = 16
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(
+      "Never treated" = "dashed",
+      "Treated countries" = "solid"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(0, 10),
+    breaks = seq(0, 10, by = 2)
+  ) +
+  scale_x_continuous(
+    breaks = unique(galtan_group_trajectories$year),
+    expand = expansion(mult = c(0.02, 0.32))
+  ) +
+  coord_cartesian(clip = "off") +
+  labs(
+    x = "CHES wave",
+    y = "Mean GAL-TAN position"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "none",
+    axis.title.y = element_text(
+      margin = margin(r = 8)
+    ),
+    plot.margin = margin(
+      t = 5.5,
+      r = 45,
+      b = 5.5,
+      l = 5.5
+    )
+  )
+
+p_galtan_colour
+```
+
+```{r galtan-traject-color}
+# --- EXPORT FIGURE (COLOUR) ---
+# 5.77 x 4 in at 600 dpi: the figure size used throughout the thesis.
+ggsave(
+  "figure_galtan_colour.png",
+  plot = p_galtan_colour,
+  width = 5.77,
+  height = 4,
+  units = "in",
+  dpi = 600
+)
+```
+
+```{r galtan-traject-bw}
+# --- EXPORT FIGURE (BLACK AND WHITE) ---
+# Shape and line type carry the grouping so the figure survives printing.
+last_points <- galtan_group_trajectories |>
+  filter(year == max(year))
+
+ggplot(
+  galtan_group_trajectories,
+  aes(
+    x = year,
+    y = mean_galtan,
+    linetype = comparison_group,
+    shape = comparison_group,
+    group = comparison_group
+  )
+) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.35, colour = "grey40") +
+  geom_line(colour = "black", linewidth = 0.6) +
+  geom_point(colour = "black", size = 2.4) +
+  geom_text(
+    data = last_points,
+    aes(label = comparison_group),
+    hjust = 0,
+    nudge_x = 1,
+    size = 3.2,
+    colour = "black"
+  ) +
+  scale_shape_manual(values = c("Never treated" = 1, "Treated countries" = 16)) +
+  scale_linetype_manual(values = c("Never treated" = "dashed", "Treated countries" = "solid")) +
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0, 10, by = 2)) +
+  scale_x_continuous(
+    breaks = unique(galtan_group_trajectories$year),
+    expand = expansion(mult = c(0.02, 0.32))  # more room reserved on the right
+  ) +
+  coord_cartesian(clip = "off") +  # let the label draw outside the panel if needed
+  labs(x = "CHES wave", y = "Mean GAL-TAN position") +
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "none",
+    plot.margin = margin(t = 5.5, r = 45, b = 5.5, l = 5.5)  # extra physical margin on the right
+  )
+
+ggsave(
+  "figure_galtan_bw.png",
+  width = 5.77, 
+  height = 4,
+  units = "in",
+  dpi = 600
+)
+```
+
+## 3.3 Descriptive positions on core outcomes
+
+### 3.3.1 Variable operationalization
+
+```{r core-outcomes-defs}
+# --- VARIABLE DEFINITIONS (Table 2.2 in the thesis) ---
+variable_definitions <- tibble(
+  concept = c(
+    "GAL-TAN cultural dimension",
+    "Immigration policy position",
+    "Immigration salience",
+    "Economic left-right (placebo)"
+  ),
+  ches_code = c("galtan", "immigrate_policy", "immigrate_salience", "lrecon"),
+  description = c(
+    "Party position on democratic and cultural freedoms, ranging from libertarian/postmaterialist to traditional/authoritarian values",
+    "Party position on immigration policy",
+    "Relative importance of immigration policy in the party's public stance",
+    "Party position on economic issues, including taxation, regulation, and the welfare state"
+  ),
+  scale_range = c(
+    "0-10 (0 = Libertarian/Postmaterialist; 5 = Center; 10 = Traditional/Authoritarian)",
+    "0-10 (0 = Strongly favors liberal policy; 10 = Strongly favors restrictive policy)",
+    "0-10 (0 = Not important at all; 10 = Extremely important)",
+    "0-10 (0 = Extreme left; 5 = Center; 10 = Extreme right)"
+  )
+)
+
+variable_definitions
+```
+
+```{r table-vars}
+# --- FORMAT AND EXPORT TABLE 2.2 ---
+table_variables <- variable_definitions |>
+  flextable() |>
+  set_header_labels(
+    concept     = "Variable concept",
+    ches_code   = "CHES code",
+    description = "Description",
+    scale_range = "Scale range and coding anchors"
+  ) |>
+  set_table_properties(layout = "autofit", width = 1) |>   # fit to the text width
+  font(fontname = "Times New Roman", part = "all") |>
+  fontsize(size = 10, part = "header") |>
+  fontsize(size = 9,  part = "body") |>
+  bold(part = "header") |>
+  italic(j = "ches_code", part = "body") |>                # variable code in italics
+  valign(valign = "top", part = "body") |>                 # long cells aligned to the top
+  border_remove() |>
+  hline_top(part = "header",    border = officer::fp_border(width = 1.5)) |>
+  hline_bottom(part = "header", border = officer::fp_border(width = 1)) |>
+  hline_bottom(part = "body",   border = officer::fp_border(width = 1.5)) |>
+  add_footer_lines(
+    c(
+      "Note. lrecon is included as an economic placebo outcome, not as a substantive dependent variable.",
+      "Source. Definitions adapted from the 1999\u20132024 Chapel Hill Expert Survey codebook (Rovny et al., 2025)."
+    )
+  ) |>
+  fontsize(size = 9, part = "footer") |>
+  italic(part = "footer")
+
+table_variables
+
+save_as_docx(table_variables, path = "table3_3_variables.docx")
+```
+
+### 3.3.2 Summary statistics
+
+```{r summary-statistics}
+# --- SUMMARY STATISTICS (Table 2.3 in the thesis) ---
+# Build the analytical sample used throughout Section 3.3 as a plain
+# data frame with only the four key CHES variables, then preview
+# summary statistics with stargazer
+summary_data <- did_panel |>
+  select(galtan, immigrate_policy, immigrate_salience, lrecon) |>
+  as.data.frame()
+
+stargazer(
+  summary_data,
+  type = "html",
+  out  = "table34_summary_stats.html",
+  digits = 2,
+  covariate.labels = c(
+    "GAL-TAN",
+    "Immigration policy",
+    "Immigration salience",
+    "Economic left-right (placebo)"
+  ),
+  notes = c(
+    "Note. N varies across variables because the CHES immigration items (immigration policy and salience) are only available from the 2006 wave onward.",
+    "Source. Own elaboration based on the broad analytical sample drawn from the 1999-2024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+  ),
+  notes.append = FALSE,
+  notes.align  = "l"
+)
+```
+
+```{r core-outcomes-descriptive}
+# --- DESCRIPTIVE MEANS BY TREATMENT CONDITION ---
+core_outcomes_long <- did_panel |>
+  select(
+    treatment_status,
+    treated,
+    galtan,
+    immigrate_policy,
+    immigrate_salience,
+    lrecon
+  ) |>
+  pivot_longer(
+    cols = c(galtan, immigrate_policy, immigrate_salience, lrecon),
+    names_to = "outcome",
+    values_to = "value"
+  ) |>
+  filter(!is.na(value)) |>
+  mutate(
+    period = case_when(
+      treatment_status == "Never treated" ~ "Never treated",
+      treated == 0 ~ "Pre-treatment",
+      treated == 1 ~ "Post-treatment"
+    )
+  ) |>
+  group_by(outcome, period) |>
+  summarise(
+    n = n(),
+    mean = mean(value),
+    sd = sd(value),
+    se = sd / sqrt(n),
+    lower = mean - 1.96 * se,
+    upper = mean + 1.96 * se,
+    .groups = "drop"
+  )
+
+ggplot(core_outcomes_long, aes(x = period, y = mean)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15) +
+  geom_point(size = 2.6) +
+  facet_wrap(
+    ~ outcome,
+    scales = "free_y",
+    labeller = as_labeller(c(
+      galtan = "GAL-TAN",
+      immigrate_policy = "Immigration policy",
+      immigrate_salience = "Immigration salience",
+      lrecon = "Economic left-right"
+    ))
+  ) +
+  labs(
+    title = "Descriptive positions on core outcomes",
+    subtitle = "Means with 95% confidence intervals; not causal estimates",
+    x = NULL,
+    y = "Mean party position"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+```{r core-outcomes-improved}
+# --- SAME AGGREGATION, CHRONOLOGICAL PERIOD ORDER ---
+# A shared y-axis range keeps the four outcome panels directly comparable.
+core_outcomes_long_bw <- did_panel |>
+  select(treatment_status, treated, galtan, immigrate_policy, immigrate_salience, lrecon) |>
+  pivot_longer(cols = c(galtan, immigrate_policy, immigrate_salience, lrecon),
+               names_to = "outcome", values_to = "value") |>
+  filter(!is.na(value)) |>
+  mutate(
+    period = case_when(
+      treatment_status == "Never treated" ~ "Never treated",
+      treated == 0 ~ "Pre-treatment",
+      treated == 1 ~ "Post-treatment"
+    ),
+    period = factor(period, levels = c("Never treated", "Pre-treatment", "Post-treatment"))
+  ) |>
+  group_by(outcome, period) |>
+  summarise(n = n(), mean = mean(value), sd = sd(value), se = sd / sqrt(n),
+            lower = mean - 1.96 * se, upper = mean + 1.96 * se, .groups = "drop")
+
+y_range <- core_outcomes_long_bw |>
+  summarise(y_min = min(lower), y_max = max(upper))
+
+y_limits <- c(floor(y_range$y_min * 2) / 2, ceiling(y_range$y_max * 2) / 2)
+y_breaks <- seq(y_limits[1], y_limits[2], by = 0.5)
+```
+
+```{r core-outcomes-final}
+# --- PANEL BUILDER ---
+# One function reused for the four outcomes instead of four near-identical blocks.
+make_outcome_panel <- function(data, outcome_name, panel_title, y_label = NULL) {
+  data |>
+    filter(outcome == outcome_name) |>
+    ggplot(aes(x = period, y = mean)) +
+    geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15, colour = "grey40") +
+    geom_point(size = 2.4, colour = "black") +
+    labs(title = panel_title, x = NULL, y = y_label) +
+    scale_y_continuous(limits = y_limits, breaks = y_breaks, labels = scales::label_number(accuracy = 0.1)) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title = element_text(size = 10, hjust = 0),
+      axis.text.x = element_text(size = 8, angle = 30, hjust = 1),
+      axis.title.y = element_text(margin = margin(r = 8))
+    )
+}
+
+p_galtan    <- make_outcome_panel(core_outcomes_long_bw, "galtan", "GAL-TAN", "Mean party position")
+p_immig_pol <- make_outcome_panel(core_outcomes_long_bw, "immigrate_policy", "Immigration policy")
+p_immig_sal <- make_outcome_panel(core_outcomes_long_bw, "immigrate_salience", "Immigration salience", "Mean party position")
+p_lrecon    <- make_outcome_panel(core_outcomes_long_bw, "lrecon", "Economic left-right")
+
+(p_galtan + p_immig_pol) / (p_immig_sal + p_lrecon) +
+  plot_annotation(tag_levels = "A")
+```
+
+```{r core-outcomes-export}
+# --- EXPORT FIGURE ---
+ggsave(
+  "figure_core_outcomes_bw.png",
+  width = 5.77,
+  height = 5.5,
+  units = "in",
+  dpi = 600
+)
+```
+
+# 4. Empirical strategy
+
+## 4.1 TWFE benchmark and Sun-Abraham event study
+
+```{r twfe-and-sunab}
+# --- TWFE BENCHMARK AND SUN-ABRAHAM EVENT STUDY ---
+# TWFE is reported as a benchmark only: with staggered timing and heterogeneous
+# effects it is biased (negative weights, forbidden comparisons).
+# sunab() needs a finite cohort id, so never-treated units are coded 1000.
+twfe_galtan <- feols(
+  galtan ~ treated | party_id + wave,
+  data = did_panel,
+  cluster = ~country
+)
+
+did_panel_sa <- did_panel |>
+  mutate(cohort_sa = if_else(g_wave == 0, 1000L, g_wave))
+
+sunab_galtan <- feols(
+  galtan ~ sunab(cohort_sa, wave) | party_id + wave,
+  data = did_panel_sa,
+  cluster = ~country
+)
+
+summary(twfe_galtan)
+summary(sunab_galtan, agg = "att")
+```
+
+```{r sunab-galtan-plot}
+# --- SUN-ABRAHAM EVENT-STUDY PLOT ---
+iplot(
+  sunab_galtan,
+  ref.line = -0.5,
+  xlab = "CHES waves relative to treatment",
+  main = "Sun-Abraham event study: GAL-TAN"
+)
+```
+
+# 5. Main results
+
+## 5.1 GAL-TAN
+
+```{r callaway-santanna-galtan}
+# --- MAIN ESTIMATE: GAL-TAN (CALLAWAY-SANT'ANNA) ---
+# control_group = 'notyettreated' enlarges the comparison pool, which matters
+# with this few country clusters.
+# clustervars = 'country' because treatment is assigned at country level.
+# allow_unbalanced_panel = TRUE: parties enter and leave CHES waves.
+# The fixed seed makes the multiplier-bootstrap SEs exactly reproducible.
+set.seed(1234) # Fixed seed ensures reproducible bootstrap SEs/CIs (Callaway & Sant'Anna estimator)
+
+cs_galtan <- att_gt(
+  yname = "galtan",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_galtan_simple <- aggte(
+  cs_galtan,
+  type = "simple",
+  na.rm = TRUE
+)
+
+summary(cs_galtan_simple)
+```
+
+## 5.2 Immigration policy
+
+```{r immigration-panel-and-estimate}
+# --- MAIN ESTIMATE: IMMIGRATION POLICY ---
+# Restricted to 2006 onwards (item availability); the Netherlands is dropped
+# because of consecutive missing values on the immigration items.
+did_panel_immigration <- did_panel |>
+  filter(
+    year >= 2006,
+    !is.na(immigrate_policy),
+    country_name != "Netherlands"
+  )
+
+set.seed(1234)
+
+cs_immigration <- att_gt(
+  yname = "immigrate_policy",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_immigration,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_immigration_simple <- aggte(
+  cs_immigration,
+  type = "simple",
+  na.rm = TRUE
+)
+
+summary(cs_immigration_simple)
+```
+
+## 5.3 Immigration issue salience
+
+```{r immigration-salience-estimate}
+# --- MAIN ESTIMATE: IMMIGRATION SALIENCE ---
+did_panel_immigration_salience <- did_panel |>
+  filter(
+    year >= 2006,
+    !is.na(immigrate_salience),
+    country_name != "Netherlands"
+  )
+
+set.seed(1234)
+
+cs_immigration_salience <- att_gt(
+  yname = "immigrate_salience",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_immigration_salience,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_immigration_salience_simple <- aggte(
+  cs_immigration_salience,
+  type = "simple",
+  na.rm = TRUE
+)
+
+summary(cs_immigration_salience_simple)
+```
+
+## 5.4 Main-results table and forest plot
+
+```{r main-results-table}
+# --- MAIN RESULTS TABLE DATA ---
+main_results <- bind_rows(
+  tibble(
+    sample = "Broad sample",
+    outcome = "GAL-TAN",
+    att = cs_galtan_simple$overall.att,
+    se = cs_galtan_simple$overall.se
+  ),
+  tibble(
+    sample = "Broad sample",
+    outcome = "Immigration policy",
+    att = cs_immigration_simple$overall.att,
+    se = cs_immigration_simple$overall.se
+  ),
+  tibble(
+    sample = "Broad sample",
+    outcome = "Immigration salience",
+    att = cs_immigration_salience_simple$overall.att,
+    se = cs_immigration_salience_simple$overall.se
+  )
+) |>
+  mutate(
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  )
+
+main_results
+```
+
+```{r main-results-forest-plot}
+# --- MAIN RESULTS FOREST PLOT ---
+ggplot(
+  main_results,
+  aes(
+    x = att,
+    y = forcats::fct_reorder(outcome, att)
+  )
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_errorbar(
+  aes(xmin = lower, xmax = upper),
+  width = 0.15,
+  orientation = "y"
+) +
+  geom_point(size = 2.8) +
+  labs(
+    title = "Average treatment effects on core outcomes",
+    subtitle = "Callaway-Sant'Anna estimates, broad sample, 95% confidence intervals",
+    x = "Average treatment effect on the treated",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+# 6. Diagnostics and robustness
+
+## 6.1 Dynamic effects and pre-treatment trajectories
+
+```{r dynamic-effects}
+# --- DYNAMIC (EVENT-TIME) AGGREGATION ---
+# cband = FALSE returns pointwise confidence intervals, which is what the
+# thesis figures and their notes report.
+set.seed(1234)
+
+cs_galtan_dynamic <- aggte(
+  cs_galtan,
+  type = "dynamic",
+  na.rm = TRUE,
+  cband = FALSE
+)
+
+set.seed(1234)
+
+cs_immigration_dynamic <- aggte(
+  cs_immigration,
+  type = "dynamic",
+  na.rm = TRUE,
+  cband = FALSE
+)
+
+summary(cs_galtan_dynamic)
+summary(cs_immigration_dynamic)
+```
+
+```{r dynamic-galtan-plot}
+# --- DYNAMIC EFFECTS PLOT: GAL-TAN (Appendix Figure B.1) ---
+p_galtan_dynamic <- ggdid(
+  cs_galtan_dynamic,
+  xlab = "CHES waves relative to treatment",
+  ylab = "Average treatment effect",
+  title = " ",
+  legend = TRUE,
+  ref_line = 0,
+  theming = TRUE
+) +
+  geom_vline(
+    xintercept = -0.5,
+    linetype = "dotted",
+    linewidth = 0.4,
+    colour = "grey50"
+  ) +
+  labs(
+    title = NULL,
+    subtitle = NULL,
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    axis.title.y = element_text(
+      margin = margin(r = 8)
+    ),
+    plot.margin = margin(
+      t = 5.5,
+      r = 5.5,
+      b = 5.5,
+      l = 5.5
+    )
+  )
+
+p_galtan_dynamic
+```
+
+```{r dynamic-galtan-export}
+# --- EXPORT APPENDIX FIGURE B.1 ---
+ggsave(
+  "figure_dynamic_galtan_colour.png",
+  plot = p_galtan_dynamic,
+  width = 5.77,
+  height = 4,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r dynamic-immigration-table-data}
+# --- WAVE-BY-WAVE ESTIMATES (Appendix Table B.2) ---
+immigration_dynamic_results <- tibble(
+  event_time = cs_immigration_dynamic$egt,
+  att = cs_immigration_dynamic$att.egt,
+  se = cs_immigration_dynamic$se.egt
+) |>
+  mutate(
+    period = if_else(
+      event_time < 0,
+      "Pre-treatment",
+      "Post-treatment"
+    ),
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  ) |>
+  select(
+    event_time,
+    period,
+    att,
+    se,
+    lower,
+    upper
+  ) |>
+  arrange(event_time)
+
+immigration_dynamic_results
+```
+
+```{r dynamic-immigration-table-format}
+# --- FORMAT APPENDIX TABLE B.2 ---
+immigration_dynamic_fmt <- immigration_dynamic_results |>
+  mutate(
+    stars = if_else(lower > 0 | upper < 0, "*", ""),
+    event_time = case_when(
+      event_time > 0 ~ paste0("+", event_time),
+      TRUE ~ as.character(event_time)
+    ),
+    `ATT` = paste0(sprintf("%.3f", att), stars),
+    `SE` = sprintf("%.3f", se),
+    `95% CI` = sprintf("[%.3f, %.3f]", lower, upper)
+  ) |>
+  select(
+    `Event time` = event_time,
+    `Period` = period,
+    `ATT`,
+    `SE`,
+    `95% CI`
+  )
+
+immigration_dynamic_fmt
+```
+
+```{r dynamic-immigration-table-export}
+# --- EXPORT APPENDIX TABLE B.2 ---
+stargazer(
+  as.data.frame(immigration_dynamic_fmt),
+  type = "html",
+  summary = FALSE,
+  rownames = FALSE,
+  notes = c(
+    "<em>Note.</em> ATT = average treatment effect on the treated; SE = standard error; CI = confidence interval. Event time 0 denotes the first CHES wave in which treatment is observed. Negative and positive values denote waves before and after treatment, respectively. * indicates that the 95% pointwise confidence interval excludes zero.",
+    "<em>Source.</em> Own elaboration based on the 1999–2024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+  ),
+  notes.append = FALSE,
+  notes.align = "l",
+  out = "tableA1_dynamic_immigration.html"
+)
+```
+
+```{r dynamic-immigration-plot}
+# --- DYNAMIC EFFECTS PLOT: IMMIGRATION (Appendix Figure B.2) ---
+p_immigration_dynamic <- ggdid(
+  cs_immigration_dynamic,
+  xlab = "CHES waves relative to treatment",
+  ylab = "Average treatment effect",
+  title = " ",
+  legend = TRUE,
+  ref_line = 0,
+  theming = TRUE
+) +
+  geom_vline(
+    xintercept = -0.5,
+    linetype = "dotted",
+    linewidth = 0.4,
+    colour = "grey50"
+  ) +
+  labs(
+    title = NULL,
+    subtitle = NULL,
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    axis.title.y = element_text(
+      margin = margin(r = 8)
+    ),
+    plot.margin = margin(
+      t = 5.5,
+      r = 5.5,
+      b = 5.5,
+      l = 5.5
+    )
+  )
+
+p_immigration_dynamic
+```
+
+```{r dynamic-immigration-export}
+# --- EXPORT APPENDIX FIGURE B.2 ---
+ggsave(
+  "figure_dynamic_immigration_colour.png",
+  plot = p_immigration_dynamic,
+  width = 5.77,
+  height = 4,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+## 6.2 Comparative summary table on core mainstream positioning
+
+```{r table-comparative-data}
+# --- COMPARATIVE ESTIMATES TABLE DATA (Table 3.1) ---
+table_comparative_core <- bind_rows(
+  tibble(
+    outcome = "GAL-TAN (galtan)",
+    estimator = "TWFE Benchmark (OLS)",
+    att = coef(twfe_galtan)["treated"],
+    se = se(twfe_galtan)["treated"]
+  ),
+  tibble(
+    outcome = "GAL-TAN (galtan)",
+    estimator = "Sun-Abraham (IW)",
+    att = summary(sunab_galtan, agg = "att")$coeftable[1, "Estimate"],
+    se = summary(sunab_galtan, agg = "att")$coeftable[1, "Std. Error"]
+  ),
+  tibble(
+    outcome = "GAL-TAN (galtan)",
+    estimator = "Callaway-Sant'Anna (Simple aggregation)",
+    att = cs_galtan_simple$overall.att,
+    se = cs_galtan_simple$overall.se
+  ),
+  tibble(
+    outcome = "GAL-TAN (galtan)",
+    estimator = "Callaway-Sant'Anna (Dynamic aggregation)",
+    att = cs_galtan_dynamic$overall.att,
+    se = cs_galtan_dynamic$overall.se
+  ),
+  tibble(
+    outcome = "Immigration position (immigrate_policy)",
+    estimator = "Callaway-Sant'Anna (Simple aggregation)",
+    att = cs_immigration_simple$overall.att,
+    se = cs_immigration_simple$overall.se
+  ),
+  tibble(
+    outcome = "Immigration policy (immigrate_policy)",
+    estimator = "Callaway-Sant'Anna (Dynamic aggregation)",
+    att = cs_immigration_dynamic$overall.att,
+    se = cs_immigration_dynamic$overall.se
+  ),
+  tibble(
+    outcome = "Immigration salience (immigrate_salience)",
+    estimator = "Callaway-Sant'Anna (Simple aggregation)",
+    att = cs_immigration_salience_simple$overall.att,
+    se = cs_immigration_salience_simple$overall.se
+  )
+) |>
+  mutate(
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  )
+
+table_comparative_core
+```
+
+```{r table-comparative-format}
+# --- FORMAT TABLE 3.1 ---
+table_comparative_fmt <- table_comparative_core |>
+  mutate(
+    stars = if_else(lower > 0 | upper < 0, "*", ""),
+    `ATT` = paste0(sprintf("%.3f", att), stars),
+    `SE` = sprintf("%.3f", se),
+    `95% CI` = sprintf("[%.3f, %.3f]", lower, upper),
+    outcome = if_else(duplicated(outcome), "", outcome)
+  ) |>
+  select(
+  `CHES outcome` = outcome,
+  `Estimator / aggregation` = estimator,
+  `ATT`,
+  `SE`,
+  `95% CI`
+)
+
+table_comparative_fmt
+```
+
+```{r table-comparative-export}
+# --- EXPORT TABLE 3.1 ---
+stargazer(
+  as.data.frame(table_comparative_fmt),
+  type = "html",
+  summary = FALSE,
+  rownames = FALSE,
+  notes = c(
+  "<em>Note.</em> ATT = average treatment effect on the treated; SE = standard error; CI = confidence interval; TWFE = two-way fixed effects; IW = interaction-weighted event study. * indicates that the 95% confidence interval excludes zero. Callaway-Sant'Anna group-time ATTs are estimated using the doubly robust method; simple and dynamic refer to alternative aggregation schemes.",
+  "<em>Source.</em> Own elaboration based on the 1999–2024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+),
+  notes.append = FALSE,
+  notes.align = "l",
+  out = "table6_2_comparative.html"
+)
+```
+
+## 6.3 Alternative comparison group
+
+```{r never-treated-robustness}
+# --- ROBUSTNESS: NEVER-TREATED COMPARISON GROUP ---
+# Same specification as the main model with control_group = 'nevertreated',
+# to check that the flat cultural result is not an artefact of the larger
+# not-yet-treated control pool.
+cs_galtan_never <- att_gt(
+  yname = "galtan",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel,
+  control_group = "nevertreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_galtan_never_simple <- aggte(
+  cs_galtan_never, type = "simple", na.rm = TRUE
+)
+
+summary(cs_galtan_never_simple)
+```
+
+## 6.4 Electoral-size thresholds
+
+```{r threshold-5-percent-main-outcomes}
+# --- ROBUSTNESS: 5% PRE-TREATMENT VOTE SAMPLE (Appendix Table B.1) ---
+did_panel_5_immigration <- did_panel_5 |>
+  filter(
+    year >= 2006,
+    !is.na(immigrate_policy),
+    country_name != "Netherlands"
+  )
+
+cs_galtan_5 <- att_gt(
+  yname = "galtan",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_5,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_galtan_5_simple <- aggte(cs_galtan_5, type = "simple", na.rm = TRUE)
+
+cs_immigration_5 <- att_gt(
+  yname = "immigrate_policy",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_5_immigration,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_immigration_5_simple <- aggte(
+  cs_immigration_5,
+  type = "simple",
+  na.rm = TRUE
+)
+
+summary(cs_galtan_5_simple)
+summary(cs_immigration_5_simple)
+```
+
+```{r threshold-10-percent-galtan}
+# --- ROBUSTNESS: 10% PRE-TREATMENT VOTE SAMPLE (Appendix Table B.1) ---
+cs_galtan_10 <- att_gt(
+  yname = "galtan",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_10,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_galtan_10_simple <- aggte(cs_galtan_10, type = "simple", na.rm = TRUE)
+
+summary(cs_galtan_10_simple)
+```
+
+## 6.5 Outcome specificity
+
+```{r outcome-specificity}
+# --- OUTCOME SPECIFICITY AND ECONOMIC PLACEBO ---
+# multiculturalism: alternative cultural indicator.
+# lrecon: economic placebo. A significant effect here would indicate that
+# breakthrough timing coincides with broader programmatic adjustment rather
+# than an issue-specific cultural response.
+did_panel_multiculturalism <- did_panel |>
+  filter(
+    year >= 2006,
+    !is.na(multiculturalism),
+    country_name != "Netherlands"
+  )
+
+cs_multiculturalism <- att_gt(
+  yname = "multiculturalism",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_multiculturalism,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_multiculturalism_simple <- aggte(
+  cs_multiculturalism,
+  type = "simple",
+  na.rm = TRUE
+)
+
+cs_lrecon <- att_gt(
+  yname = "lrecon",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_lrecon_simple <- aggte(cs_lrecon, type = "simple", na.rm = TRUE)
+
+cs_lrecon_5 <- att_gt(
+  yname = "lrecon",
+  tname = "wave",
+  idname = "party_id",
+  gname = "g_wave",
+  data = did_panel_5,
+  control_group = "notyettreated",
+  clustervars = "country",
+  allow_unbalanced_panel = TRUE
+)
+
+cs_lrecon_5_simple <- aggte(cs_lrecon_5, type = "simple", na.rm = TRUE)
+
+outcome_specificity_results <- bind_rows(
+  tibble(
+    sample = "Broad sample",
+    outcome = "Multiculturalism",
+    att = cs_multiculturalism_simple$overall.att,
+    se = cs_multiculturalism_simple$overall.se
+  ),
+  tibble(
+    sample = "Broad sample",
+    outcome = "Economic left-right",
+    att = cs_lrecon_simple$overall.att,
+    se = cs_lrecon_simple$overall.se
+  ),
+  tibble(
+    sample = "5% threshold",
+    outcome = "Economic left-right",
+    att = cs_lrecon_5_simple$overall.att,
+    se = cs_lrecon_5_simple$overall.se
+  )
+) |>
+  mutate(
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  )
+
+outcome_specificity_results
+```
+
+```{r robustness-results-data}
+# --- ROBUSTNESS AND PLACEBO RESULTS: DATA (Appendix Table B.1) ---
+# Collects the estimates produced in 6.3-6.5 into a single tidy table.
+robustness_placebo_results <- bind_rows(
+  tibble(
+    category = "Alternative control group",
+    specification = "Never-treated controls only",
+    outcome = "GAL-TAN (galtan)",
+    att = cs_galtan_never_simple$overall.att,
+    se = cs_galtan_never_simple$overall.se
+  ),
+  tibble(
+    category = "Electoral-size thresholds",
+    specification = "5% pre-treatment vote sample",
+    outcome = "GAL-TAN (galtan)",
+    att = cs_galtan_5_simple$overall.att,
+    se = cs_galtan_5_simple$overall.se
+  ),
+  tibble(
+    category = "Electoral-size thresholds",
+    specification = "10% pre-treatment vote sample",
+    outcome = "GAL-TAN (galtan)",
+    att = cs_galtan_10_simple$overall.att,
+    se = cs_galtan_10_simple$overall.se
+  ),
+  tibble(
+    category = "Electoral-size thresholds",
+    specification = "5% pre-treatment vote sample",
+    outcome = "Immigration policy (immigrate_policy)",
+    att = cs_immigration_5_simple$overall.att,
+    se = cs_immigration_5_simple$overall.se
+  ),
+  tibble(
+    category = "Outcome-specificity check",
+    specification = "Broad sample",
+    outcome = "Multiculturalism (multiculturalism)",
+    att = cs_multiculturalism_simple$overall.att,
+    se = cs_multiculturalism_simple$overall.se
+  ),
+  tibble(
+    category = "Placebo-dimension check",
+    specification = "Broad sample",
+    outcome = "Economic left-right (lrecon)",
+    att = cs_lrecon_simple$overall.att,
+    se = cs_lrecon_simple$overall.se
+  ),
+  tibble(
+    category = "Placebo-dimension check",
+    specification = "5% pre-treatment vote sample",
+    outcome = "Economic left-right (lrecon)",
+    att = cs_lrecon_5_simple$overall.att,
+    se = cs_lrecon_5_simple$overall.se
+  )
+) |>
+  mutate(
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  )
+
+robustness_placebo_results
+```
+
+```{r robustness-results-format}
+# --- FORMAT APPENDIX TABLE B.1 ---
+robustness_placebo_fmt <- robustness_placebo_results |>
+  mutate(
+    stars = if_else(lower > 0 | upper < 0, "*", ""),
+    category_display = if_else(
+      duplicated(category),
+      "",
+      category
+    ),
+    `ATT` = paste0(sprintf("%.3f", att), stars),
+    `SE` = sprintf("%.3f", se),
+    `95% CI` = sprintf("[%.3f, %.3f]", lower, upper)
+  ) |>
+  select(
+    `Robustness category` = category_display,
+    `Sample / specification` = specification,
+    `Dependent variable (CHES)` = outcome,
+    `ATT`,
+    `SE`,
+    `95% CI`
+  )
+
+robustness_placebo_fmt
+```
+
+```{r robustness-results-export}
+# --- EXPORT APPENDIX TABLE B.1 ---
+stargazer(
+  as.data.frame(robustness_placebo_fmt),
+  type = "html",
+  summary = FALSE,
+  rownames = FALSE,
+  notes = c(
+    "<em>Note.</em> Entries report doubly robust simple aggregate average treatment effects on the treated (ATTs) estimated using the Callaway and Sant’Anna staggered difference-in-differences estimator. Standard errors are clustered at the country level. CI = confidence interval. * indicates that the 95% confidence interval excludes zero. The alternative-control specification uses only never-treated countries; all other specifications use not-yet-treated units as the comparison group. Immigration policy and multiculturalism estimates use outcome-available observations from 2006 onward and exclude the Netherlands.",
+    "<em>Source.</em> Own elaboration based on the 1999–2024 Chapel Hill Expert Survey trend file (Rovny et al., 2025)."
+  ),
+  notes.append = FALSE,
+  notes.align = "l",
+  out = "table4_2_robustness.html"
+)
+```
+
+## 6.6 Summary table of robustness checks
+
+```{r robustness-summary-superseded, eval=FALSE}
+# --- SUPERSEDED DRAFT TABLE (not run) ---
+# Kept for the record only. It calls format_att_table() on an object
+# (robustness_results) that is never created in this script, and the table it
+# was meant to produce is the one built and exported just above. eval=FALSE so
+# the document knits; delete the chunk if it is no longer wanted.
+format_att_table(
+  robustness_results,
+  caption = "Table X. Callaway-Sant’Anna estimates and robustness checks"
+)
+```
+
+# 7. Heterogeneity by party family
+
+## 7.1 Mainstream right versus mainstream left
+
+```{r party-family-heterogeneity}
+# --- HETEROGENEITY BY PARTY FAMILY (H3) ---
+# Mainstream right (conservative and Christian-democratic families) against
+# mainstream left (socialist family), on the 5% pre-treatment vote sample.
+estimate_galtan_att <- function(data) {
+  att_gt(
+    yname = "galtan",
+    tname = "wave",
+    idname = "party_id",
+    gname = "g_wave",
+    data = data,
+    control_group = "notyettreated",
+    clustervars = "country",
+    allow_unbalanced_panel = TRUE
+  )
+}
+
+cs_galtan_right_5 <- estimate_galtan_att(
+  did_panel_5 |>
+    filter(family %in% c(2, 4))
+)
+
+cs_galtan_left_5 <- estimate_galtan_att(
+  did_panel_5 |>
+    filter(family == 5)
+)
+
+galtan_right_left_5 <- bind_rows(
+  tibble(
+    group = "Mainstream right",
+    att = aggte(cs_galtan_right_5, type = "simple", na.rm = TRUE)$overall.att,
+    se = aggte(cs_galtan_right_5, type = "simple", na.rm = TRUE)$overall.se
+  ),
+  tibble(
+    group = "Mainstream left",
+    att = aggte(cs_galtan_left_5, type = "simple", na.rm = TRUE)$overall.att,
+    se = aggte(cs_galtan_left_5, type = "simple", na.rm = TRUE)$overall.se
+  )
+) |>
+  mutate(
+    lower = att - 1.96 * se,
+    upper = att + 1.96 * se
+  )
+
+galtan_right_left_5
+```
+
+# 8. Optional diagnostics
+
+```{r optional-party-country-trajectories, eval=FALSE}
+# --- OPTIONAL DIAGNOSTICS (not run: eval=FALSE) ---
+```
